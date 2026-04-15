@@ -180,9 +180,9 @@ class KronosPredictor:
         """
         获取指定 token 的 K 线并预测。
         
-        K 线来自现有系统的 kline_cache.db:
-        - DATA_MODE=local: 直接读本地文件
-        - DATA_MODE=api: 通过 /api/download/kline_cache 下载后读取
+        K 线获取策略:
+        1. 现有系统的 kline_cache.db (已有 ~1800 token 的数据)
+        2. GeckoTerminal 免费 API (补充 kline_cache 未覆盖的新 token)
         """
         kline_df = self._get_klines(token_ca)
 
@@ -193,20 +193,99 @@ class KronosPredictor:
 
     def _get_klines(self, token_ca: str) -> pd.DataFrame:
         """
-        从现有系统的 kline_cache.db 获取 K 线。
+        多源获取 K 线。
+        优先 kline_cache.db, 不够则从 GeckoTerminal 补充。
         """
+        df = None
+
+        # 策略 1: 从现有系统的 kline_cache.db 读取
         if DATA_MODE == "api" and self._api_client:
-            # 通过共享的 API client 下载缓存的 kline_cache.db
             try:
                 db_path = self._api_client.download_kline_db()
                 if db_path:
-                    return self._read_klines_from_db(token_ca, db_path)
+                    df = self._read_klines_from_db(token_ca, db_path)
             except Exception as e:
                 print(f"   ⚠️ 下载 K 线缓存失败: {e}")
-                return None
         else:
-            # 本地模式: 直接读文件
-            return self._read_klines_from_db(token_ca, KLINE_DB_PATH)
+            df = self._read_klines_from_db(token_ca, KLINE_DB_PATH)
+
+        if df is not None and len(df) >= 10:
+            return df
+
+        # 策略 2: kline_cache 没有数据 → 从 GeckoTerminal 获取
+        # (现有系统的 KlineCollector 只收集已在监控列表中的 token,
+        #  新信号的 meme coin 通常还没被收集)
+        return self._fetch_from_gecko(token_ca)
+
+    def _fetch_from_gecko(self, token_ca: str) -> pd.DataFrame:
+        """从 GeckoTerminal 免费 API 获取 K 线 (补充 kline_cache 盲区)"""
+        import time
+        import requests
+
+        headers = {"Accept": "application/json", "User-Agent": "KronosShadow/1.0"}
+
+        # Step 1: 查找 pool 地址
+        try:
+            r = requests.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_ca}/pools",
+                headers=headers, timeout=15,
+                params={"page": "1", "sort": "h24_volume_usd_desc"}
+            )
+            if r.status_code == 429:
+                time.sleep(30)
+                r = requests.get(
+                    f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_ca}/pools",
+                    headers=headers, timeout=15,
+                    params={"page": "1", "sort": "h24_volume_usd_desc"}
+                )
+            if r.status_code != 200:
+                return None
+
+            pools = r.json().get("data", [])
+            if not pools:
+                return None
+
+            pool_id = pools[0].get("id", "").replace("solana_", "")
+            pool_name = pools[0].get("attributes", {}).get("name", "")
+        except Exception:
+            return None
+
+        # Step 2: 获取 OHLCV
+        time.sleep(2)
+        try:
+            r = requests.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_id}/ohlcv/minute",
+                headers=headers, timeout=15,
+                params={"aggregate": "1", "limit": "200", "token": "base"}
+            )
+            if r.status_code != 200:
+                return None
+
+            ohlcv_list = r.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+            if not ohlcv_list:
+                return None
+
+            bars = []
+            for bar in ohlcv_list:
+                if len(bar) >= 6:
+                    bars.append({
+                        "timestamp": int(bar[0]),
+                        "open": float(bar[1]), "high": float(bar[2]),
+                        "low": float(bar[3]), "close": float(bar[4]),
+                        "volume": float(bar[5]),
+                    })
+
+            bars.sort(key=lambda x: x["timestamp"])
+            df = pd.DataFrame(bars)
+            df.index = pd.to_datetime(df["timestamp"], unit="s")
+            df = df[["open", "high", "low", "close", "volume"]]
+
+            print(f"   🌐 GeckoTerminal: {len(df)} bars ({pool_name})")
+            return df
+
+        except Exception:
+            return None
+
 
     def _read_klines_from_db(self, token_ca: str, db_path: str) -> pd.DataFrame:
         """从 SQLite 数据库读取 K 线"""

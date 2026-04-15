@@ -159,7 +159,8 @@ class SentinelAPIClient:
 
     def get_kline_features(self, token_ca: str, before_ts: int) -> dict:
         """
-        从缓存的 kline_cache.db 提取 K 线特征。
+        提取 K 线特征。
+        优先从 kline_cache.db, 不够则从 GeckoTerminal 获取。
         """
         default_features = {
             "kline_bars_available": 0, "kline_trend_slope": 0,
@@ -167,16 +168,122 @@ class SentinelAPIClient:
             "kline_green_ratio": 0, "kline_upper_wick_ratio": 0,
         }
 
+        # 策略 1: 从 kline_cache.db 提取
         db_path = self.download_kline_db()
-        if not db_path:
-            return default_features
+        if db_path:
+            try:
+                from src.gbdt.feature_extractor import _extract_kline_features, _connect_readonly
+                conn = _connect_readonly(db_path)
+                features = _extract_kline_features(conn, token_ca, before_ts)
+                conn.close()
+                if features.get("kline_bars_available", 0) > 0:
+                    return features
+            except Exception:
+                pass
+
+        # 策略 2: kline_cache 没有 → 从 GeckoTerminal 获取后计算特征
+        try:
+            bars = self._fetch_gecko_bars(token_ca)
+            if bars and len(bars) >= 5:
+                return self._compute_kline_features(bars)
+        except Exception:
+            pass
+
+        return default_features
+
+    def _fetch_gecko_bars(self, token_ca: str) -> list:
+        """从 GeckoTerminal 获取 K 线原始数据"""
+        import time as _time
+
+        headers = {"Accept": "application/json", "User-Agent": "KronosShadow/1.0"}
 
         try:
-            from src.gbdt.feature_extractor import _extract_kline_features, _connect_readonly
-            conn = _connect_readonly(db_path)
-            features = _extract_kline_features(conn, token_ca, before_ts)
-            conn.close()
-            return features
-        except Exception as e:
-            print(f"⚠️  K 线特征提取失败: {e}")
-            return default_features
+            r = requests.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_ca}/pools",
+                headers=headers, timeout=15,
+                params={"page": "1", "sort": "h24_volume_usd_desc"}
+            )
+            if r.status_code != 200:
+                return []
+            pools = r.json().get("data", [])
+            if not pools:
+                return []
+
+            pool_id = pools[0].get("id", "").replace("solana_", "")
+            _time.sleep(2)
+
+            r = requests.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_id}/ohlcv/minute",
+                headers=headers, timeout=15,
+                params={"aggregate": "1", "limit": "200", "token": "base"}
+            )
+            if r.status_code != 200:
+                return []
+
+            ohlcv = r.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+            bars = []
+            for bar in ohlcv:
+                if len(bar) >= 6:
+                    bars.append({
+                        "timestamp": int(bar[0]),
+                        "open": float(bar[1]), "high": float(bar[2]),
+                        "low": float(bar[3]), "close": float(bar[4]),
+                        "volume": float(bar[5]),
+                    })
+            bars.sort(key=lambda x: x["timestamp"])
+            return bars
+        except Exception:
+            return []
+
+    def _compute_kline_features(self, bars: list) -> dict:
+        """从原始 K 线数组计算 GBDT 特征"""
+        import numpy as np
+
+        n = len(bars)
+        closes = [b["close"] for b in bars]
+        opens = [b["open"] for b in bars]
+        highs = [b["high"] for b in bars]
+        lows = [b["low"] for b in bars]
+        volumes = [b["volume"] for b in bars]
+
+        # 趋势斜率 (线性回归)
+        x = np.arange(n)
+        if n >= 2 and np.std(closes) > 0:
+            slope = float(np.polyfit(x, closes, 1)[0])
+            slope_normalized = slope / (np.mean(closes) + 1e-15)
+        else:
+            slope_normalized = 0.0
+
+        # 波动率
+        mean_close = np.mean(closes) if closes else 1
+        volatility = float(np.std(closes) / (mean_close + 1e-15))
+
+        # 成交量趋势
+        if n >= 2 and np.std(volumes) > 0:
+            vol_slope = float(np.polyfit(x, volumes, 1)[0])
+            vol_normalized = vol_slope / (np.mean(volumes) + 1e-15)
+        else:
+            vol_normalized = 0.0
+
+        # 阳线占比
+        green_count = sum(1 for o, c in zip(opens, closes) if c >= o)
+        green_ratio = green_count / n if n > 0 else 0.5
+
+        # 上影线比率
+        wick_ratios = []
+        for h, c, o in zip(highs, closes, opens):
+            body_top = max(c, o)
+            bar_range = h - min(c, o)
+            if bar_range > 0:
+                wick_ratios.append((h - body_top) / bar_range)
+        upper_wick = float(np.mean(wick_ratios)) if wick_ratios else 0.0
+
+        return {
+            "kline_bars_available": n,
+            "kline_trend_slope": slope_normalized,
+            "kline_volatility": volatility,
+            "kline_volume_trend": vol_normalized,
+            "kline_green_ratio": green_ratio,
+            "kline_upper_wick_ratio": upper_wick,
+        }
+
