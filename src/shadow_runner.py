@@ -34,11 +34,6 @@ class ShadowTrader:
     """
 
     def __init__(self):
-        self.gbdt = GBDTPredictor()
-        self.kronos = KronosPredictor()
-        self.kelly = EnhancedKelly(total_capital_sol=5.0)
-        self.running = False
-        self._last_signal_id = 0
         self._api_client = None
 
         # 根据模式初始化数据源
@@ -48,6 +43,12 @@ class ShadowTrader:
             print(f"📡 数据模式: HTTP API ({SENTINEL_API_URL})")
         else:
             print(f"📂 数据模式: 本地文件")
+
+        self.gbdt = GBDTPredictor()
+        self.kronos = KronosPredictor(api_client=self._api_client)
+        self.kelly = EnhancedKelly(total_capital_sol=5.0)
+        self.running = False
+        self._last_signal_id = 0
 
     def init_shadow_db(self):
         """初始化影子交易数据库"""
@@ -223,7 +224,7 @@ class ShadowTrader:
             except Exception:
                 sig_features = {"signal_count": 1, "signal_velocity": 0}
 
-        return {
+        features = {
             "market_cap": signal.get("market_cap", 0) or 0,
             "holders": signal.get("holders", 0) or 0,
             "volume_24h": signal.get("volume_24h", 0) or 0,
@@ -236,6 +237,15 @@ class ShadowTrader:
             **kline_features,
             "market_regime": 0.0,
         }
+
+        # Debug: 打印 K 线特征 (诊断是否全为 0)
+        kline_bars = kline_features.get("kline_bars_available", 0)
+        if kline_bars > 0:
+            print(f"   📊 K线特征: {kline_bars} bars, slope={kline_features.get('kline_trend_slope', 0):.4f}, vol={kline_features.get('kline_volatility', 0):.4f}")
+        else:
+            print(f"   ⚠️ 无 K 线数据 (特征全为 0)")
+
+        return features
 
     def process_signal(self, signal: dict) -> dict:
         """处理单个信号, 做影子决策"""

@@ -34,12 +34,13 @@ class KronosPredictor:
     - 预测置信度 (多路径方差)
     """
 
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, api_client=None):
         self.device = device or KRONOS_DEVICE
         self.model = None
         self.tokenizer = None
         self.predictor = None
         self._loaded = False
+        self._api_client = api_client  # 共享的 API 客户端实例
 
     def load(self) -> bool:
         """加载 Kronos 模型 (首次会从 HuggingFace 下载)"""
@@ -194,12 +195,10 @@ class KronosPredictor:
         """
         从现有系统的 kline_cache.db 获取 K 线。
         """
-        if DATA_MODE == "api":
-            # 通过 API 下载缓存的 kline_cache.db, 然后读取
+        if DATA_MODE == "api" and self._api_client:
+            # 通过共享的 API client 下载缓存的 kline_cache.db
             try:
-                from src.api_client import SentinelAPIClient
-                client = SentinelAPIClient()
-                db_path = client.download_kline_db()
+                db_path = self._api_client.download_kline_db()
                 if db_path:
                     return self._read_klines_from_db(token_ca, db_path)
             except Exception as e:
