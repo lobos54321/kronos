@@ -261,14 +261,15 @@ class ShadowTrader:
         gbdt_output = self.gbdt.predict(features)
         print(f"   GBDT: p={gbdt_output['win_probability']:.3f} ({gbdt_output['confidence']})")
 
-        # Step 3: Kronos 预测
+        # Step 3: Kronos 预测 (统计模式)
         kronos_output = self.kronos.predict_for_token(token_ca)
-        if kronos_output["pred_df"] is not None:
-            print(f"   Kronos: trend={kronos_output['trend_direction']:+.4f}, "
+        if kronos_output["confidence"] > 0:
+            print(f"   趋势: trend={kronos_output['trend_direction']:+.4f}, "
                   f"vol={kronos_output['implied_volatility']:.4f}, "
+                  f"up={kronos_output['upside']:.4f}, down={kronos_output['downside']:.4f}, "
                   f"conf={kronos_output['confidence']:.2f}")
         else:
-            print(f"   Kronos: 降级 (无预测)")
+            print(f"   趋势: 降级 (无 K 线数据)")
 
         # Step 4: Kelly 计算
         kelly_output = self.kelly.calculate(gbdt_output, kronos_output)
