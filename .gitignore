@@ -1,0 +1,10 @@
+# Dependencies
+data/
+models/
+__pycache__/
+*.pyc
+.env
+*.db
+*.db-shm
+*.db-wal
+.venv/
