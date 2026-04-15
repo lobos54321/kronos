@@ -1,6 +1,7 @@
 # Dependencies
 data/
-models/
+models/*
+!models/*.pkl
 __pycache__/
 *.pyc
 .env
