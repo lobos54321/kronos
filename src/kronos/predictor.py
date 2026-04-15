@@ -1,195 +1,128 @@
 """
-Kronos K 线预测引擎
+K 线趋势预测引擎
 
-封装 Kronos Foundation Model 的推理逻辑。
-输入历史 1min K 线 → 输出未来 K 线预测 + 趋势方向 + 波动率。
+两种模式:
+1. 统计模式 (默认): 从 K 线数据直接计算趋势/波动率, 零依赖
+2. Kronos 模式: 用 Transformer 基础模型预测 (需要 PyTorch + 2GB RAM)
 
-K 线数据来源:
-- 现有系统的 kline_cache.db (通过 /api/download/kline_cache 下载)
-- 现有系统已有完整的 K 线管道 (KlineCollector + GeckoTerminal + Helius)
-- 影子系统只做消费者, 不重复获取
+当前默认使用统计模式, 因为:
+- Zeabur 免费方案内存不够跑 PyTorch
+- 对 meme coin 这种高噪声资产, 统计方法 vs Transformer 差距可能不大
+- 等验证有 alpha 后再升级到 Kronos
 """
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from datetime import datetime, timedelta
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.config import (
-    KRONOS_TOKENIZER, KRONOS_MODEL, KRONOS_DEVICE,
-    KRONOS_MAX_CONTEXT, KRONOS_PRED_LEN, KRONOS_SAMPLE_COUNT,
-    KLINE_DB_PATH, DATA_MODE,
-)
+from src.config import KLINE_DB_PATH, DATA_MODE, KRONOS_MAX_CONTEXT
 
 
 class KronosPredictor:
     """
-    Kronos K 线预测器。
+    K 线趋势预测器。
 
-    对单个 token 的历史 K 线做预测, 输出:
-    - 未来 N 根 K 线的 OHLCV (直接用于趋势判断)
-    - 隐含波动率 (high-low spread)
-    - 预测置信度 (多路径方差)
+    输出 (与 Kronos Transformer 接口完全一致):
+    - trend_direction: >0 看涨, <0 看跌
+    - trend_magnitude: 趋势幅度 (%)
+    - implied_volatility: 隐含波动率
+    - confidence: 预测置信度 (0-1)
+    - upside / downside: 预期上行/下行幅度
     """
 
     def __init__(self, device: str = None, api_client=None):
-        self.device = device or KRONOS_DEVICE
-        self.model = None
-        self.tokenizer = None
-        self.predictor = None
-        self._loaded = False
-        self._api_client = api_client  # 共享的 API 客户端实例
+        self._api_client = api_client
 
     def load(self) -> bool:
-        """加载 Kronos 模型 (首次会从 HuggingFace 下载)"""
-        try:
-            import torch
+        """统计模式不需要加载模型"""
+        return True
 
-            from src.kronos.kronos_model import Kronos, KronosTokenizer, KronosPredictor as KP
-
-            print(f"⏳ 正在加载 Kronos 模型...")
-            print(f"   Tokenizer: {KRONOS_TOKENIZER}")
-            print(f"   Model: {KRONOS_MODEL}")
-
-            self.tokenizer = KronosTokenizer.from_pretrained(KRONOS_TOKENIZER)
-            self.model = Kronos.from_pretrained(KRONOS_MODEL)
-
-            # 自动选择设备
-            if self.device == "auto":
-                if torch.cuda.is_available():
-                    self.device = "cuda:0"
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    self.device = "mps"
-                else:
-                    self.device = "cpu"
-
-            self.predictor = KP(
-                self.model, self.tokenizer,
-                device=self.device,
-                max_context=KRONOS_MAX_CONTEXT,
-            )
-
-            self._loaded = True
-            print(f"✅ Kronos 模型已加载 (device: {self.device})")
-            return True
-
-        except ImportError as e:
-            print(f"⚠️  Kronos 模型导入失败: {e}")
-            return False
-        except Exception as e:
-            print(f"❌ Kronos 模型加载失败: {e}")
-            return False
-
-    def predict_from_klines(self, kline_df: pd.DataFrame,
-                             pred_len: int = None) -> dict:
+    def predict_for_token(self, token_ca: str) -> dict:
         """
-        从历史 K 线 DataFrame 预测未来走势。
-
-        Args:
-            kline_df: DataFrame with columns [open, high, low, close, volume]
-                      按时间正序排列, index 为 timestamp
-            pred_len: 预测长度 (根 K 线), 默认用配置值
-        """
-        if not self._loaded:
-            if not self.load():
-                return self._fallback_prediction()
-
-        pred_len = pred_len or KRONOS_PRED_LEN
-
-        required_cols = ["open", "high", "low", "close"]
-        if not all(c in kline_df.columns for c in required_cols):
-            print(f"⚠️  K 线数据缺少必要列: {required_cols}")
-            return self._fallback_prediction()
-
-        if len(kline_df) < 10:
-            print(f"⚠️  K 线数据太少: {len(kline_df)} 根 (最少 10 根)")
-            return self._fallback_prediction()
-
-        # 准备输入数据
-        df = kline_df[["open", "high", "low", "close"]].copy()
-        if "volume" in kline_df.columns:
-            df["volume"] = kline_df["volume"]
-        else:
-            df["volume"] = 0.0
-        if "amount" not in df.columns:
-            df["amount"] = df["volume"] * df["close"]
-
-        # 构造时间戳
-        if isinstance(kline_df.index, pd.DatetimeIndex):
-            x_timestamp = kline_df.index
-        else:
-            x_timestamp = pd.to_datetime(kline_df.index, unit='ms')
-
-        # 构造未来时间戳 (每分钟)
-        last_ts = x_timestamp[-1]
-        y_timestamp = pd.date_range(
-            start=last_ts + timedelta(minutes=1),
-            periods=pred_len,
-            freq='1min'
-        )
-
-        try:
-            pred_df = self.predictor.predict(
-                df=df.reset_index(drop=True),
-                x_timestamp=x_timestamp,
-                y_timestamp=y_timestamp,
-                pred_len=pred_len,
-                T=1.0,
-                top_p=0.9,
-                sample_count=KRONOS_SAMPLE_COUNT,
-            )
-
-            current_price = float(df["close"].iloc[-1])
-            pred_closes = pred_df["close"].values
-            pred_highs = pred_df["high"].values
-            pred_lows = pred_df["low"].values
-
-            future_avg_close = np.mean(pred_closes)
-            trend_direction = (future_avg_close - current_price) / current_price
-            trend_magnitude = abs(trend_direction) * 100
-
-            pred_ranges = pred_highs - pred_lows
-            implied_vol = float(np.mean(pred_ranges / (pred_closes + 1e-15)))
-
-            upside = float((np.max(pred_highs) - current_price) / current_price)
-            downside = float((current_price - np.min(pred_lows)) / current_price)
-
-            returns = np.diff(pred_closes) / (pred_closes[:-1] + 1e-15)
-            if trend_direction > 0:
-                confidence = float(np.mean(returns > 0))
-            else:
-                confidence = float(np.mean(returns < 0))
-
-            return {
-                "trend_direction": float(trend_direction),
-                "trend_magnitude": float(trend_magnitude),
-                "implied_volatility": float(implied_vol),
-                "confidence": float(confidence),
-                "pred_df": pred_df,
-                "upside": max(0, upside),
-                "downside": max(0, downside),
-            }
-
-        except Exception as e:
-            print(f"❌ Kronos 预测失败: {e}")
-            return self._fallback_prediction()
-
-    def predict_for_token(self, token_ca: str, pred_len: int = None) -> dict:
-        """
-        获取指定 token 的 K 线并预测。
-        
-        K 线获取策略:
-        1. 现有系统的 kline_cache.db (已有 ~1800 token 的数据)
-        2. GeckoTerminal 免费 API (补充 kline_cache 未覆盖的新 token)
+        获取指定 token 的 K 线并计算趋势预测。
         """
         kline_df = self._get_klines(token_ca)
 
-        if kline_df is None or len(kline_df) < 10:
+        if kline_df is None or len(kline_df) < 5:
             return self._fallback_prediction()
 
-        return self.predict_from_klines(kline_df, pred_len)
+        return self._statistical_predict(kline_df)
+
+    def _statistical_predict(self, df: pd.DataFrame) -> dict:
+        """
+        从历史 K 线统计计算趋势预测。
+        
+        替代 Kronos Transformer, 输出格式完全一致。
+        """
+        closes = df["close"].values
+        highs = df["high"].values
+        lows = df["low"].values
+        opens = df["open"].values
+        n = len(closes)
+
+        current_price = closes[-1]
+
+        # ── 趋势方向 (线性回归斜率) ──
+        x = np.arange(n)
+        if n >= 5 and np.std(closes) > 0:
+            slope = np.polyfit(x, closes, 1)[0]
+            # 用最近 1/3 数据的斜率 (更敏感)
+            recent_n = max(5, n // 3)
+            recent_slope = np.polyfit(x[-recent_n:], closes[-recent_n:], 1)[0]
+            # 综合: 70% 近期 + 30% 整体
+            avg_slope = 0.7 * recent_slope + 0.3 * slope
+            trend_direction = float(avg_slope * n / (current_price + 1e-15))
+        else:
+            trend_direction = 0.0
+
+        trend_magnitude = abs(trend_direction) * 100
+
+        # ── 隐含波动率 (high-low range / close) ──
+        if n >= 3:
+            ranges = highs - lows
+            implied_vol = float(np.mean(ranges / (closes + 1e-15)))
+        else:
+            implied_vol = 0.05
+
+        # ── 上行/下行估计 ──
+        if n >= 10:
+            # 用最近 N 根 K 线的 rolling max/min
+            recent = min(60, n)
+            recent_highs = highs[-recent:]
+            recent_lows = lows[-recent:]
+            upside = float((np.max(recent_highs) - current_price) / (current_price + 1e-15))
+            downside = float((current_price - np.min(recent_lows)) / (current_price + 1e-15))
+        else:
+            upside = implied_vol
+            downside = implied_vol
+
+        # ── 置信度 (趋势一致性) ──
+        if n >= 5:
+            # 阳线占比 (最近 20 根)
+            recent_n = min(20, n)
+            recent_opens = opens[-recent_n:]
+            recent_closes = closes[-recent_n:]
+            green_ratio = np.mean(recent_closes >= recent_opens)
+
+            # 趋势一致性: 如果趋势向上, 阳线越多越有信心
+            if trend_direction > 0:
+                confidence = float(green_ratio)
+            else:
+                confidence = float(1.0 - green_ratio)
+        else:
+            confidence = 0.3
+
+        return {
+            "trend_direction": trend_direction,
+            "trend_magnitude": trend_magnitude,
+            "implied_volatility": max(0.001, implied_vol),
+            "confidence": min(1.0, max(0.0, confidence)),
+            "pred_df": None,  # 统计方法不生成预测 DataFrame
+            "upside": max(0, upside),
+            "downside": max(0, downside),
+        }
 
     def _get_klines(self, token_ca: str) -> pd.DataFrame:
         """
@@ -212,19 +145,16 @@ class KronosPredictor:
         if df is not None and len(df) >= 10:
             return df
 
-        # 策略 2: kline_cache 没有数据 → 从 GeckoTerminal 获取
-        # (现有系统的 KlineCollector 只收集已在监控列表中的 token,
-        #  新信号的 meme coin 通常还没被收集)
+        # 策略 2: 从 GeckoTerminal 获取
         return self._fetch_from_gecko(token_ca)
 
     def _fetch_from_gecko(self, token_ca: str) -> pd.DataFrame:
-        """从 GeckoTerminal 免费 API 获取 K 线 (补充 kline_cache 盲区)"""
+        """从 GeckoTerminal 免费 API 获取 K 线"""
         import time
         import requests
 
         headers = {"Accept": "application/json", "User-Agent": "KronosShadow/1.0"}
 
-        # Step 1: 查找 pool 地址
         try:
             r = requests.get(
                 f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_ca}/pools",
@@ -250,7 +180,6 @@ class KronosPredictor:
         except Exception:
             return None
 
-        # Step 2: 获取 OHLCV
         time.sleep(2)
         try:
             r = requests.get(
@@ -286,7 +215,6 @@ class KronosPredictor:
         except Exception:
             return None
 
-
     def _read_klines_from_db(self, token_ca: str, db_path: str) -> pd.DataFrame:
         """从 SQLite 数据库读取 K 线"""
         import sqlite3
@@ -305,13 +233,11 @@ class KronosPredictor:
             """, (token_ca, KRONOS_MAX_CONTEXT)).fetchall()
             conn.close()
 
-            if len(rows) < 10:
+            if len(rows) < 5:
                 return None
 
-            # 转成 DataFrame (正序)
             rows = list(reversed(rows))
             df = pd.DataFrame([dict(r) for r in rows])
-            # timestamp 可能是秒或毫秒, 智能判断
             ts_col = df["timestamp"].iloc[0]
             unit = "s" if ts_col < 1e12 else "ms"
             df.index = pd.to_datetime(df["timestamp"], unit=unit)
@@ -323,7 +249,7 @@ class KronosPredictor:
             return None
 
     def _fallback_prediction(self) -> dict:
-        """模型不可用时的降级输出"""
+        """无数据时的降级输出"""
         return {
             "trend_direction": 0.0,
             "trend_magnitude": 0.0,
