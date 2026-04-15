@@ -1,7 +1,8 @@
 """
 Kronos Shadow Trader — 配置管理
 
-只读连接现有系统数据库，影子交易写入独立 DB。
+通过 HTTP API 从现有系统获取数据，影子交易写入独立 DB。
+支持两种模式: HTTP API (Zeabur 部署) 或本地文件 (本地调试)
 """
 
 import os
@@ -11,7 +12,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# 现有系统数据源 (只读)
+# 现有系统 API 连接 (Zeabur 部署时使用)
+# ============================================================
+SENTINEL_API_URL = os.getenv(
+    "SENTINEL_API_URL",
+    "https://sentiment-arbitrage.zeabur.app"
+)
+SENTINEL_TOKEN = os.getenv("SENTINEL_TOKEN", "mytoken54321")
+
+# 数据获取模式: "api" (通过 HTTP) 或 "local" (本地文件)
+DATA_MODE = os.getenv("DATA_MODE", "api")
+
+# ============================================================
+# 本地文件路径 (DATA_MODE=local 时使用)
 # ============================================================
 SENTIMENT_DB_PATH = os.getenv(
     "SENTIMENT_DB_PATH",

@@ -3,6 +3,10 @@
 
 轮询现有系统的 premium_signals，用 GBDT + Kronos + Kelly 做影子决策。
 所有决策记录到独立数据库，不执行任何真实交易。
+
+支持两种数据获取模式:
+- DATA_MODE=api  → 通过 HTTP API 从现有系统拉取 (Zeabur 部署)
+- DATA_MODE=local → 直接读取本地 SQLite 文件 (本地调试)
 """
 
 import sqlite3
@@ -15,11 +19,11 @@ from datetime import datetime
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from src.config import (
+    SENTINEL_API_URL, SENTINEL_TOKEN, DATA_MODE,
     SENTIMENT_DB_PATH, KLINE_DB_PATH, SHADOW_DB_PATH,
     POLL_INTERVAL, SHADOW_POSITION_SIZE_SOL,
 )
 from src.gbdt.predictor import GBDTPredictor
-from src.gbdt.feature_extractor import _connect_readonly, _extract_kline_features, _count_prior_signals
 from src.kronos.predictor import KronosPredictor
 from src.kelly.enhanced_kelly import EnhancedKelly
 
@@ -35,6 +39,15 @@ class ShadowTrader:
         self.kelly = EnhancedKelly(total_capital_sol=5.0)
         self.running = False
         self._last_signal_id = 0
+        self._api_client = None
+
+        # 根据模式初始化数据源
+        if DATA_MODE == "api":
+            from src.api_client import SentinelAPIClient
+            self._api_client = SentinelAPIClient()
+            print(f"📡 数据模式: HTTP API ({SENTINEL_API_URL})")
+        else:
+            print(f"📂 数据模式: 本地文件")
 
     def init_shadow_db(self):
         """初始化影子交易数据库"""
@@ -142,8 +155,26 @@ class ShadowTrader:
         conn.close()
 
     def _get_new_signals(self) -> list:
-        """从现有系统只读获取新信号"""
+        """获取新信号 — 自动选择 API 或本地模式"""
+        if self._api_client:
+            return self._get_new_signals_api()
+        else:
+            return self._get_new_signals_local()
+
+    def _get_new_signals_api(self) -> list:
+        """通过 HTTP API 获取新信号"""
         try:
+            return self._api_client.get_new_signals(
+                after_id=self._last_signal_id, limit=50
+            )
+        except Exception as e:
+            print(f"⚠️  API 读取信号失败: {e}")
+            return []
+
+    def _get_new_signals_local(self) -> list:
+        """从本地 SQLite 文件获取新信号"""
+        try:
+            from src.gbdt.feature_extractor import _connect_readonly
             sig_conn = _connect_readonly(SENTIMENT_DB_PATH)
             rows = sig_conn.execute("""
                 SELECT id, token_ca, symbol, market_cap, holders,
@@ -165,24 +196,32 @@ class ShadowTrader:
         ts = signal["timestamp"]
 
         # K 线特征
-        try:
-            kline_conn = _connect_readonly(KLINE_DB_PATH)
-            kline_features = _extract_kline_features(kline_conn, token_ca, ts)
-            kline_conn.close()
-        except Exception:
-            kline_features = {
-                "kline_bars_available": 0, "kline_trend_slope": 0,
-                "kline_volatility": 0, "kline_volume_trend": 0,
-                "kline_green_ratio": 0, "kline_upper_wick_ratio": 0,
-            }
+        if self._api_client:
+            kline_features = self._api_client.get_kline_features(token_ca, ts)
+        else:
+            try:
+                from src.gbdt.feature_extractor import _connect_readonly, _extract_kline_features
+                kline_conn = _connect_readonly(KLINE_DB_PATH)
+                kline_features = _extract_kline_features(kline_conn, token_ca, ts)
+                kline_conn.close()
+            except Exception:
+                kline_features = {
+                    "kline_bars_available": 0, "kline_trend_slope": 0,
+                    "kline_volatility": 0, "kline_volume_trend": 0,
+                    "kline_green_ratio": 0, "kline_upper_wick_ratio": 0,
+                }
 
         # 信号统计
-        try:
-            sig_conn = _connect_readonly(SENTIMENT_DB_PATH)
-            sig_features = _count_prior_signals(sig_conn, token_ca, ts)
-            sig_conn.close()
-        except Exception:
-            sig_features = {"signal_count": 1, "signal_velocity": 0}
+        if self._api_client:
+            sig_features = self._api_client.count_prior_signals(token_ca, ts)
+        else:
+            try:
+                from src.gbdt.feature_extractor import _connect_readonly, _count_prior_signals
+                sig_conn = _connect_readonly(SENTIMENT_DB_PATH)
+                sig_features = _count_prior_signals(sig_conn, token_ca, ts)
+                sig_conn.close()
+            except Exception:
+                sig_features = {"signal_count": 1, "signal_velocity": 0}
 
         return {
             "market_cap": signal.get("market_cap", 0) or 0,
@@ -266,11 +305,12 @@ class ShadowTrader:
 
     def run(self):
         """主循环"""
+        data_source = f"API: {SENTINEL_API_URL}" if self._api_client else f"本地: {SENTIMENT_DB_PATH}"
+
         print("=" * 60)
         print("🌙 Kronos Shadow Trader — 影子交易模式")
         print("=" * 60)
-        print(f"   信号源: {SENTIMENT_DB_PATH}")
-        print(f"   K线源: {KLINE_DB_PATH}")
+        print(f"   数据源: {data_source}")
         print(f"   影子DB: {SHADOW_DB_PATH}")
         print(f"   轮询: 每 {POLL_INTERVAL} 秒")
         print(f"   ⚠️  纯影子模式 — 不执行任何真实交易")
