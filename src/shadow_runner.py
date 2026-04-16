@@ -431,10 +431,10 @@ class ShadowTrader:
                     try:
                         conn = sqlite3.connect(shadow_db)
                         total = conn.execute("SELECT COUNT(*) FROM shadow_decisions").fetchone()[0]
-                        enters = conn.execute("SELECT COUNT(*) FROM shadow_decisions WHERE decision='ENTER'").fetchone()[0]
-                        skips = conn.execute("SELECT COUNT(*) FROM shadow_decisions WHERE decision='SKIP'").fetchone()[0]
+                        enters = conn.execute("SELECT COUNT(*) FROM shadow_decisions WHERE kelly_decision='ENTER'").fetchone()[0]
+                        skips = conn.execute("SELECT COUNT(*) FROM shadow_decisions WHERE kelly_decision='SKIP'").fetchone()[0]
                         recent = conn.execute("""
-                            SELECT signal_id, symbol, decision, gbdt_win_prob, kelly_fraction, created_at
+                            SELECT signal_id, symbol, kelly_decision, gbdt_win_prob, kelly_fraction, created_at
                             FROM shadow_decisions ORDER BY id DESC LIMIT 20
                         """).fetchall()
                         conn.close()
