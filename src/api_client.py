@@ -34,6 +34,7 @@ class SentinelAPIClient:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._kline_db_path = None
         self._kline_db_last_download = 0
+        self._gecko_bars_cache = {}  # token_ca -> list of bars (内存缓存)
 
     def _get(self, path, params=None, stream=False, timeout=60):
         """发送 GET 请求"""
@@ -185,11 +186,17 @@ class SentinelAPIClient:
         try:
             bars = self._fetch_gecko_bars(token_ca)
             if bars and len(bars) >= 5:
+                # 缓存 bars 供趋势预测器复用
+                self._gecko_bars_cache[token_ca] = bars
                 return self._compute_kline_features(bars)
         except Exception:
             pass
 
         return default_features
+
+    def get_cached_gecko_bars(self, token_ca: str) -> list:
+        """获取已缓存的 GeckoTerminal bars (避免重复请求)"""
+        return self._gecko_bars_cache.get(token_ca, [])
 
     def _fetch_gecko_bars(self, token_ca: str) -> list:
         """从 GeckoTerminal 获取 K 线原始数据"""

@@ -142,10 +142,20 @@ class KronosPredictor:
         else:
             df = self._read_klines_from_db(token_ca, KLINE_DB_PATH)
 
-        if df is not None and len(df) >= 10:
+        if df is not None and len(df) >= 5:
             return df
 
-        # 策略 2: 从 GeckoTerminal 获取
+        # 策略 2: 复用 api_client 已缓存的 GeckoTerminal 数据
+        # (GBDT 特征提取可能已经从 GeckoTerminal 获取过了)
+        if self._api_client:
+            cached_bars = self._api_client.get_cached_gecko_bars(token_ca)
+            if cached_bars and len(cached_bars) >= 5:
+                cached_df = pd.DataFrame(cached_bars)
+                cached_df.index = pd.to_datetime(cached_df["timestamp"], unit="s")
+                cached_df = cached_df[["open", "high", "low", "close", "volume"]]
+                return cached_df
+
+        # 策略 3: 独立从 GeckoTerminal 获取 (仅在未缓存时)
         return self._fetch_from_gecko(token_ca)
 
     def _fetch_from_gecko(self, token_ca: str) -> pd.DataFrame:
