@@ -336,6 +336,9 @@ class ShadowTrader:
         self.gbdt.load()
         # Kronos 延迟加载 (首次预测时)
 
+        # 启动 API 服务线程 (用于下载影子数据库和查看统计)
+        self._start_api_server()
+
         self.running = True
 
         # 优雅退出
@@ -378,6 +381,101 @@ class ShadowTrader:
         print(f"\n🏁 影子交易已停止。最终统计:")
         print(f"   决策: {decisions_count}")
         print(f"   最后信号: #{self._last_signal_id}")
+
+
+    def _start_api_server(self):
+        """启动一个简单的 HTTP API 线程, 用于下载数据和查看统计"""
+        import threading
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import os
+
+        shadow_db = SHADOW_DB_PATH
+        token = SENTINEL_TOKEN
+
+        class ShadowAPIHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # 静默日志
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                params = {}
+                if "?" in self.path:
+                    for p in self.path.split("?")[1].split("&"):
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            params[k] = v
+
+                # 简单 token 鉴权
+                if params.get("token") != token:
+                    self.send_response(401)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"unauthorized"}')
+                    return
+
+                if path == "/api/download/shadow_db":
+                    # 下载 shadow_trades.db
+                    if os.path.exists(shadow_db):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Disposition", "attachment; filename=shadow_trades.db")
+                        self.end_headers()
+                        with open(shadow_db, "rb") as f:
+                            self.wfile.write(f.read())
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"shadow db not found"}')
+
+                elif path == "/api/stats":
+                    # 返回决策统计 JSON
+                    try:
+                        conn = sqlite3.connect(shadow_db)
+                        total = conn.execute("SELECT COUNT(*) FROM shadow_decisions").fetchone()[0]
+                        enters = conn.execute("SELECT COUNT(*) FROM shadow_decisions WHERE decision='ENTER'").fetchone()[0]
+                        skips = conn.execute("SELECT COUNT(*) FROM shadow_decisions WHERE decision='SKIP'").fetchone()[0]
+                        recent = conn.execute("""
+                            SELECT signal_id, symbol, decision, gbdt_win_prob, kelly_fraction, created_at
+                            FROM shadow_decisions ORDER BY id DESC LIMIT 20
+                        """).fetchall()
+                        conn.close()
+
+                        result = {
+                            "total": total, "enters": enters, "skips": skips,
+                            "enter_rate": round(enters / max(total, 1) * 100, 1),
+                            "recent": [
+                                {"signal_id": r[0], "symbol": r[1], "decision": r[2],
+                                 "gbdt_p": r[3], "kelly": r[4], "time": r[5]}
+                                for r in recent
+                            ]
+                        }
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps(result, indent=2).encode())
+                    except Exception as e:
+                        self.send_response(500)
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": str(e)}).encode())
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "service": "Kronos Shadow Trader",
+                        "endpoints": [
+                            "/api/stats?token=xxx",
+                            "/api/download/shadow_db?token=xxx",
+                        ]
+                    }).encode())
+
+        def run_server():
+            port = int(os.environ.get("PORT", 8080))
+            server = HTTPServer(("0.0.0.0", port), ShadowAPIHandler)
+            print(f"🌐 影子 API 启动: http://0.0.0.0:{port}")
+            server.serve_forever()
+
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
 
 
 if __name__ == "__main__":
