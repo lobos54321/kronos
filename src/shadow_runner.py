@@ -15,6 +15,9 @@ import json
 import signal as signal_module
 from pathlib import Path
 from datetime import datetime
+import threading
+import urllib.request
+from urllib.error import URLError
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
@@ -339,6 +342,9 @@ class ShadowTrader:
         # 启动 API 服务线程 (用于下载影子数据库和查看统计)
         self._start_api_server()
 
+        # 启动自动价格跟踪线程
+        self._start_price_tracker()
+
         self.running = True
 
         # 优雅退出
@@ -382,6 +388,124 @@ class ShadowTrader:
         print(f"   决策: {decisions_count}")
         print(f"   最后信号: #{self._last_signal_id}")
 
+    def _start_price_tracker(self):
+        """后台自动获取 ENTER Token 的后续价格、快照和 PnL (用 DexScreener)"""
+        def tracker_loop():
+            # 初次启动延迟20秒再开始
+            time.sleep(20)
+            while self.running:
+                try:
+                    conn = sqlite3.connect(SHADOW_DB_PATH)
+                    conn.row_factory = sqlite3.Row
+                    # 取过去 4 小时内标记为 ENTER 的单子
+                    rows = conn.execute("""
+                        SELECT id, token_ca, symbol, signal_ts, entry_price_at_decision,
+                               actual_price_30min, actual_price_60min, actual_price_120min
+                        FROM shadow_decisions
+                        WHERE kelly_decision = 'ENTER'
+                          AND created_at >= datetime('now', '-4 hours')
+                    """).fetchall()
+                    
+                    if not rows:
+                        conn.close()
+                        time.sleep(60)
+                        continue
+
+                    ca_to_row = {}
+                    for r in rows:
+                        ca = r["token_ca"]
+                        if ca not in ca_to_row:
+                            ca_to_row[ca] = []
+                        ca_to_row[ca].append(dict(r))
+
+                    # 批量分发给 DexScreener, 最多30个一组
+                    cas = list(ca_to_row.keys())
+                    for i in range(0, len(cas), 30):
+                        batch = cas[i:i+30]
+                        req_url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(batch)}"
+                        req = urllib.request.Request(req_url, headers={"User-Agent": "ShadowTracker/1.0"})
+                        try:
+                            resp = urllib.request.urlopen(req, timeout=15)
+                            data = json.loads(resp.read())
+                            pairs = data.get("pairs", [])
+                            
+                            now_ms = int(time.time() * 1000)
+                            
+                            # 解析价格
+                            prices = {}
+                            for p in pairs:
+                                ba = p.get("baseToken", {}).get("address")
+                                usd = p.get("priceUsd")
+                                if ba and usd:
+                                    # 假如一个CA有多个Dex池被返回，我们只取看到的第一条（默认按流动性/时间排序较好）
+                                    if ba not in prices:
+                                        prices[ba] = float(usd)
+
+                            for ca in batch:
+                                if ca not in prices:
+                                    continue
+                                
+                                current_price = prices[ca]
+                                
+                                for row in ca_to_row[ca]:
+                                    signal_ts = row["signal_ts"]
+                                    if not signal_ts: 
+                                        continue
+                                    
+                                    # 如果是秒级时间戳, 转毫秒
+                                    if signal_ts < 1e12:
+                                        signal_ts = signal_ts * 1000
+                                        
+                                    minutes_since = (now_ms - signal_ts) / 60000.0
+                                    
+                                    if minutes_since < 0:
+                                        continue
+                                        
+                                    dec_id = row["id"]
+                                    entry_price = row["entry_price_at_decision"]
+                                    
+                                    # 1. 记录轨迹快照
+                                    # (避免数据库太庞大, 同一 token & decision 每分钟只记录1次左右, 因为外层 sleep 是 60s)
+                                    conn.execute("""
+                                        INSERT INTO shadow_price_tracking 
+                                        (decision_id, token_ca, check_ts, price, minutes_since_decision)
+                                        VALUES (?, ?, ?, ?, ?)
+                                    """, (dec_id, ca, int(time.time()), current_price, int(minutes_since)))
+
+                                    # 2. 回填 entry_price (0 ~ 5分钟内拿到的最早价格算入场价)
+                                    if entry_price is None and minutes_since <= 5:
+                                        conn.execute("""
+                                            UPDATE shadow_decisions
+                                            SET entry_price_at_decision = ?
+                                            WHERE id = ? AND entry_price_at_decision IS NULL
+                                        """, (current_price, dec_id))
+                                        entry_price = current_price
+                                    
+                                    # 3. 如果我们有了基准的入场价, 可以算出 PnL
+                                    if entry_price and entry_price > 0:
+                                        c_pnl = (current_price - entry_price) / entry_price * 100
+                                        
+                                        if row["actual_price_30min"] is None and minutes_since >= 30:
+                                            conn.execute("UPDATE shadow_decisions SET actual_price_30min=?, actual_pnl_30min=? WHERE id=?", (current_price, c_pnl, dec_id))
+                                        elif row["actual_price_60min"] is None and minutes_since >= 60:
+                                            conn.execute("UPDATE shadow_decisions SET actual_price_60min=?, actual_pnl_60min=? WHERE id=?", (current_price, c_pnl, dec_id))
+                                        elif row["actual_price_120min"] is None and minutes_since >= 120:
+                                            conn.execute("UPDATE shadow_decisions SET actual_price_120min=?, actual_pnl_120min=? WHERE id=?", (current_price, c_pnl, dec_id))
+
+                        except Exception as inner_e:
+                            print(f"[Tracker] 批次抓取失败: {inner_e}")
+                            
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"❌ [Tracker] 线程异常: {e}")
+                
+                # 循环间隔: 60s (这样能有相对高频的快照以查峰值)
+                time.sleep(60)
+
+        t = threading.Thread(target=tracker_loop, daemon=True, name="ShadowTracker")
+        t.start()
+        print("📈 后台价格跟踪线程已启动 (DexScreener)")
 
     def _start_api_server(self):
         """启动一个简单的 HTTP API 线程, 用于下载数据和查看统计"""
