@@ -76,19 +76,28 @@ class GBDTPredictor:
         }])
         X = X.fillna(0)
 
-        # 分类预测: 盈利概率
-        win_prob = float(self.classifier.predict_proba(X)[0, 1])
+        # 如果特征严重匮乏 (没有足够的 K 线数据且没有 24h 交易量)，则判定为无数据，直接给极低胜率拒绝放行
+        kline_bars = features.get("kline_bars_available", 0)
+        volume_24h = features.get("volume_24h", 0)
 
-        # 回归预测: 预期 PnL
-        expected_pnl = float(self.regressor.predict(X)[0])
-
-        # 置信度分级
-        if win_prob >= 0.5:
-            confidence = "HIGH"
-        elif win_prob >= 0.35:
-            confidence = "MEDIUM"
+        if kline_bars < 3 and volume_24h <= 0:
+            win_prob = 0.1
+            expected_pnl = -50.0
+            confidence = "NO_DATA"
         else:
-            confidence = "LOW"
+            # 分类预测: 盈利概率
+            win_prob = float(self.classifier.predict_proba(X)[0, 1])
+
+            # 回归预测: 预期 PnL
+            expected_pnl = float(self.regressor.predict(X)[0])
+
+            # 置信度分级
+            if win_prob >= 0.5:
+                confidence = "HIGH"
+            elif win_prob >= 0.35:
+                confidence = "MEDIUM"
+            else:
+                confidence = "LOW"
 
         # 特征贡献 (用 GBDT 的 feature importance 近似)
         fi = self.metadata.get("feature_importance", [])
